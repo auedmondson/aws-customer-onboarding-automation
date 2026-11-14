@@ -1,0 +1,179 @@
+{
+  "Comment": "Validate an onboarding request, wait for review, and record its outcome.",
+  "StartAt": "ValidateRequest",
+  "States": {
+    "ValidateRequest": {
+      "Type": "Task",
+      "Resource": "${ValidationFunctionArn}",
+      "Parameters": {
+        "businessName.$": "$.businessName",
+        "contactName.$": "$.contactName",
+        "contactEmail.$": "$.contactEmail"
+      },
+      "ResultPath": "$.validation",
+      "TimeoutSeconds": 30,
+      "Retry": [
+        {
+          "ErrorEquals": [
+            "Lambda.ServiceException",
+            "Lambda.AWSLambdaException",
+            "Lambda.SdkClientException",
+            "Lambda.TooManyRequestsException"
+          ],
+          "IntervalSeconds": 2,
+          "MaxAttempts": 3,
+          "BackoffRate": 2
+        }
+      ],
+      "Catch": [
+        {
+          "ErrorEquals": ["States.ALL"],
+          "ResultPath": "$.error",
+          "Next": "MarkFailed"
+        }
+      ],
+      "Next": "IsRequestValid"
+    },
+    "IsRequestValid": {
+      "Type": "Choice",
+      "Choices": [
+        {
+          "Variable": "$.validation.isValid",
+          "BooleanEquals": true,
+          "Next": "WaitForReview"
+        }
+      ],
+      "Default": "MarkInvalid"
+    },
+    "WaitForReview": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::lambda:invoke.waitForTaskToken",
+      "Parameters": {
+        "FunctionName": "${WorkflowFunctionArn}",
+        "Payload": {
+          "action": "register_review",
+          "requestId.$": "$.requestId",
+          "taskToken.$": "$$.Task.Token"
+        }
+      },
+      "ResultPath": "$.review",
+      "TimeoutSeconds": 86400,
+      "Catch": [
+        {
+          "ErrorEquals": ["States.Timeout"],
+          "ResultPath": "$.error",
+          "Next": "MarkExpired"
+        },
+        {
+          "ErrorEquals": ["States.ALL"],
+          "ResultPath": "$.error",
+          "Next": "MarkFailed"
+        }
+      ],
+      "Next": "EvaluateDecision"
+    },
+    "EvaluateDecision": {
+      "Type": "Choice",
+      "Choices": [
+        {
+          "Variable": "$.review.decision",
+          "StringEquals": "APPROVED",
+          "Next": "MarkApproved"
+        },
+        {
+          "Variable": "$.review.decision",
+          "StringEquals": "REJECTED",
+          "Next": "MarkRejected"
+        }
+      ],
+      "Default": "MarkFailed"
+    },
+    "MarkApproved": {
+      "Type": "Pass",
+      "Result": "APPROVED",
+      "ResultPath": "$.targetStatus",
+      "Next": "PersistOutcome"
+    },
+    "MarkRejected": {
+      "Type": "Pass",
+      "Result": "REJECTED",
+      "ResultPath": "$.targetStatus",
+      "Next": "PersistOutcome"
+    },
+    "MarkInvalid": {
+      "Type": "Pass",
+      "Result": "INVALID",
+      "ResultPath": "$.targetStatus",
+      "Next": "PersistOutcome"
+    },
+    "MarkExpired": {
+      "Type": "Pass",
+      "Result": "EXPIRED",
+      "ResultPath": "$.targetStatus",
+      "Next": "PersistOutcome"
+    },
+    "PersistOutcome": {
+      "Type": "Task",
+      "Resource": "${WorkflowFunctionArn}",
+      "Parameters": {
+        "action": "set_status",
+        "requestId.$": "$.requestId",
+        "status.$": "$.targetStatus"
+      },
+      "TimeoutSeconds": 30,
+      "Retry": [
+        {
+          "ErrorEquals": ["States.TaskFailed", "States.Timeout"],
+          "IntervalSeconds": 2,
+          "MaxAttempts": 3,
+          "BackoffRate": 2
+        }
+      ],
+      "Catch": [
+        {
+          "ErrorEquals": ["States.ALL"],
+          "ResultPath": "$.error",
+          "Next": "OutcomePersistenceFailed"
+        }
+      ],
+      "End": true
+    },
+    "MarkFailed": {
+      "Type": "Task",
+      "Resource": "${WorkflowFunctionArn}",
+      "Parameters": {
+        "action": "set_status",
+        "requestId.$": "$.requestId",
+        "status": "FAILED"
+      },
+      "TimeoutSeconds": 30,
+      "ResultPath": null,
+      "Retry": [
+        {
+          "ErrorEquals": ["States.TaskFailed", "States.Timeout"],
+          "IntervalSeconds": 2,
+          "MaxAttempts": 3,
+          "BackoffRate": 2
+        }
+      ],
+      "Catch": [
+        {
+          "ErrorEquals": ["States.ALL"],
+          "ResultPath": "$.error",
+          "Next": "OutcomePersistenceFailed"
+        }
+      ],
+      "Next": "ProcessingFailed"
+    },
+    "ProcessingFailed": {
+      "Type": "Fail",
+      "Error": "OnboardingProcessingFailed",
+      "Cause": "Processing failed; the request was marked FAILED."
+    },
+    "OutcomePersistenceFailed": {
+      "Type": "Fail",
+      "Error": "OutcomePersistenceFailed",
+      "Cause": "The final request status could not be confirmed. Reconciliation is required."
+    }
+  }
+}
