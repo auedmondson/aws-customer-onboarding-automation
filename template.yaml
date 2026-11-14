@@ -2,33 +2,37 @@ AWSTemplateFormatVersion: "2010-09-09"
 Transform: AWS::Serverless-2016-10-31
 
 Description: >
-  Customer onboarding automation.
-  Foundation resources: request storage and workflow logging.
-  Application functions, API, and state machine are added incrementally.
+  Serverless customer onboarding reference implementation with
+  IAM-authenticated APIs, a review workflow, and DynamoDB storage.
 
 Parameters:
   Environment:
     Type: String
     Default: dev
-    AllowedValues:
-      - dev
-      - test
-      - prod
-    Description: Deployment environment.
+    AllowedValues: [dev, test, prod]
 
   LogRetentionDays:
     Type: Number
     Default: 14
-    AllowedValues:
-      - 7
-      - 14
-      - 30
-      - 60
-      - 90
-    Description: Number of days to retain workflow logs.
+    AllowedValues: [7, 14, 30, 60, 90]
 
 Conditions:
   IsProduction: !Equals [!Ref Environment, prod]
+
+Globals:
+  Function:
+    Runtime: python3.12
+    CodeUri: .
+    Timeout: 15
+    MemorySize: 256
+    Environment:
+      Variables:
+        REQUESTS_TABLE_NAME: !Ref RequestsTable
+    LoggingConfig:
+      LogGroup: !Ref ApplicationLogGroup
+    Tags:
+      Project: customer-onboarding-automation
+      Environment: !Ref Environment
 
 Resources:
   RequestsTable:
@@ -37,28 +41,28 @@ Resources:
     UpdateReplacePolicy: Delete
     Properties:
       BillingMode: PAY_PER_REQUEST
-
       AttributeDefinitions:
         - AttributeName: requestId
           AttributeType: S
-
       KeySchema:
         - AttributeName: requestId
           KeyType: HASH
-
       SSESpecification:
         SSEEnabled: true
-
       PointInTimeRecoverySpecification:
         PointInTimeRecoveryEnabled: !If [IsProduction, true, false]
-
       Tags:
         - Key: Project
           Value: customer-onboarding-automation
         - Key: Environment
           Value: !Ref Environment
-        - Key: ManagedBy
-          Value: CloudFormation
+
+  ApplicationLogGroup:
+    Type: AWS::Logs::LogGroup
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      RetentionInDays: !Ref LogRetentionDays
 
   WorkflowLogGroup:
     Type: AWS::Logs::LogGroup
@@ -67,23 +71,146 @@ Resources:
     Properties:
       RetentionInDays: !Ref LogRetentionDays
 
+  OnboardingApi:
+    Type: AWS::Serverless::Api
+    Properties:
+      StageName: !Ref Environment
+      EndpointConfiguration: REGIONAL
+      Auth:
+        DefaultAuthorizer: AWS_IAM
+
+  SubmissionFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      Handler: src.submission.app.lambda_handler
+      Environment:
+        Variables:
+          STATE_MACHINE_ARN: !Ref OnboardingStateMachine
+      Policies:
+        - Statement:
+            - Effect: Allow
+              Action: dynamodb:PutItem
+              Resource: !GetAtt RequestsTable.Arn
+            - Effect: Allow
+              Action: states:StartExecution
+              Resource: !Ref OnboardingStateMachine
+      Events:
+        SubmitRequest:
+          Type: Api
+          Properties:
+            RestApiId: !Ref OnboardingApi
+            Path: /requests
+            Method: post
+
+  StatusFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      Handler: src.status.app.lambda_handler
+      Policies:
+        - Statement:
+            - Effect: Allow
+              Action: dynamodb:GetItem
+              Resource: !GetAtt RequestsTable.Arn
+      Events:
+        GetStatus:
+          Type: Api
+          Properties:
+            RestApiId: !Ref OnboardingApi
+            Path: /requests/{requestId}
+            Method: get
+
+  DecisionFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      Handler: src.decision.app.lambda_handler
+      Policies:
+        - Statement:
+            - Effect: Allow
+              Action: dynamodb:UpdateItem
+              Resource: !GetAtt RequestsTable.Arn
+            # Callback APIs do not support resource-level IAM scoping.
+            # Access is limited to this function's execution role.
+            - Effect: Allow
+              Action: states:SendTaskSuccess
+              Resource: "*"
+      Events:
+        SubmitDecision:
+          Type: Api
+          Properties:
+            RestApiId: !Ref OnboardingApi
+            Path: /requests/{requestId}/decision
+            Method: post
+
+  ValidationFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      Handler: src.validation.app.lambda_handler
+
+  WorkflowFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      Handler: src.workflow.app.lambda_handler
+      Policies:
+        - Statement:
+            - Effect: Allow
+              Action: dynamodb:UpdateItem
+              Resource: !GetAtt RequestsTable.Arn
+
+  OnboardingStateMachine:
+    Type: AWS::Serverless::StateMachine
+    Properties:
+      Type: STANDARD
+      DefinitionUri: statemachine/onboarding.asl.json
+      DefinitionSubstitutions:
+        ValidationFunctionArn: !GetAtt ValidationFunction.Arn
+        WorkflowFunctionArn: !GetAtt WorkflowFunction.Arn
+      Logging:
+        Level: ERROR
+        IncludeExecutionData: false
+        Destinations:
+          - CloudWatchLogsLogGroup:
+              LogGroupArn: !GetAtt WorkflowLogGroup.Arn
+      Policies:
+        - Statement:
+            - Effect: Allow
+              Action: lambda:InvokeFunction
+              Resource:
+                - !GetAtt ValidationFunction.Arn
+                - !GetAtt WorkflowFunction.Arn
+            # These CloudWatch Logs delivery APIs require Resource "*".
+            - Effect: Allow
+              Action:
+                - logs:CreateLogDelivery
+                - logs:GetLogDelivery
+                - logs:UpdateLogDelivery
+                - logs:DeleteLogDelivery
+                - logs:ListLogDeliveries
+                - logs:PutResourcePolicy
+                - logs:DescribeResourcePolicies
+                - logs:DescribeLogGroups
+              Resource: "*"
       Tags:
-        - Key: Project
-          Value: customer-onboarding-automation
-        - Key: Environment
-          Value: !Ref Environment
-        - Key: ManagedBy
-          Value: CloudFormation
+        Project: customer-onboarding-automation
+        Environment: !Ref Environment
 
 Outputs:
+  ApiBaseUrl:
+    Description: Base URL; requests require AWS Signature Version 4.
+    Value: !Sub >-
+      https://${OnboardingApi}.execute-api.${AWS::Region}.${AWS::URLSuffix}/${Environment}
+
+  ReviewerInvokeArn:
+    Description: >
+      Grant execute-api:Invoke on this ARN only to authorized reviewers.
+      This template does not grant caller permissions.
+    Value: !Sub >-
+      arn:${AWS::Partition}:execute-api:${AWS::Region}:${AWS::AccountId}:${OnboardingApi}/${Environment}/POST/requests/*/decision
+
   RequestsTableName:
-    Description: DynamoDB table containing onboarding requests.
     Value: !Ref RequestsTable
 
-  RequestsTableArn:
-    Description: Request table ARN for scoped IAM permissions.
-    Value: !GetAtt RequestsTable.Arn
+  StateMachineArn:
+    Value: !Ref OnboardingStateMachine
 
   WorkflowLogGroupArn:
-    Description: Log group ARN for the onboarding state machine.
     Value: !GetAtt WorkflowLogGroup.Arn
