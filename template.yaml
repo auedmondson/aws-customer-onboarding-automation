@@ -1,0 +1,89 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Transform: AWS::Serverless-2016-10-31
+
+Description: >
+  Customer onboarding automation.
+  Foundation resources: request storage and workflow logging.
+  Application functions, API, and state machine are added incrementally.
+
+Parameters:
+  Environment:
+    Type: String
+    Default: dev
+    AllowedValues:
+      - dev
+      - test
+      - prod
+    Description: Deployment environment.
+
+  LogRetentionDays:
+    Type: Number
+    Default: 14
+    AllowedValues:
+      - 7
+      - 14
+      - 30
+      - 60
+      - 90
+    Description: Number of days to retain workflow logs.
+
+Conditions:
+  IsProduction: !Equals [!Ref Environment, prod]
+
+Resources:
+  RequestsTable:
+    Type: AWS::DynamoDB::Table
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      BillingMode: PAY_PER_REQUEST
+
+      AttributeDefinitions:
+        - AttributeName: requestId
+          AttributeType: S
+
+      KeySchema:
+        - AttributeName: requestId
+          KeyType: HASH
+
+      SSESpecification:
+        SSEEnabled: true
+
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: !If [IsProduction, true, false]
+
+      Tags:
+        - Key: Project
+          Value: customer-onboarding-automation
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: ManagedBy
+          Value: CloudFormation
+
+  WorkflowLogGroup:
+    Type: AWS::Logs::LogGroup
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      RetentionInDays: !Ref LogRetentionDays
+
+      Tags:
+        - Key: Project
+          Value: customer-onboarding-automation
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: ManagedBy
+          Value: CloudFormation
+
+Outputs:
+  RequestsTableName:
+    Description: DynamoDB table containing onboarding requests.
+    Value: !Ref RequestsTable
+
+  RequestsTableArn:
+    Description: Request table ARN for scoped IAM permissions.
+    Value: !GetAtt RequestsTable.Arn
+
+  WorkflowLogGroupArn:
+    Description: Log group ARN for the onboarding state machine.
+    Value: !GetAtt WorkflowLogGroup.Arn
